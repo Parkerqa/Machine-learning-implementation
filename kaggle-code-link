@@ -1,1 +1,133 @@
+import pandas as pd
+import numpy as np
+import lightgbm as lgb
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
 
+# --- 1. 載入所有相關資料 ---
+# 為了加快處理速度，我們只使用 2017 年以後的訓練資料
+# 這樣可以讓模型更關注近期的模式
+print("載入資料中...")
+base_path = '../input/store-sales-time-series-forecasting/'
+train = pd.read_csv(base_path + 'train.csv', parse_dates=['date'],
+                    dtype={'store_nbr': 'category', 'family': 'category'})
+train = train[train['date'].dt.year >= 2017] # 篩選近期資料
+
+test = pd.read_csv(base_path + 'test.csv', parse_dates=['date'],
+                   dtype={'store_nbr': 'category', 'family': 'category'})
+holidays = pd.read_csv(base_path + 'holidays_events.csv', parse_dates=['date'])
+stores = pd.read_csv(base_path + 'stores.csv', dtype={'store_nbr': 'category', 'type': 'category', 'cluster': 'category'})
+oil = pd.read_csv(base_path + 'oil.csv', parse_dates=['date'])
+
+# --- 2. 合併與預處理 ---
+print("合併資料與特徵工程...")
+
+# 合併商店資訊
+train = train.merge(stores, on='store_nbr', how='left')
+test = test.merge(stores, on='store_nbr', how='left')
+
+# 合併油價 (使用 ffill 填充週末的缺失值)
+oil['dcoilwtico'] = oil['dcoilwtico'].ffill()
+train = train.merge(oil, on='date', how='left')
+test = test.merge(oil, on='date', how='left')
+
+# 合併節假日資訊
+# 為了簡化，我們只標記全國性的非工作日
+holidays = holidays[(holidays['transferred'] == False) & (holidays['locale'] == 'National')]
+train['is_holiday'] = train.date.isin(holidays.date).astype(int)
+test['is_holiday'] = test.date.isin(holidays.date).astype(int)
+
+
+# --- 3. 特徵工程 (Feature Engineering) ---
+def create_features(df):
+    """從日期創建新特徵"""
+    df['dayofweek'] = df['date'].dt.dayofweek
+    df['month'] = df['date'].dt.month
+    df['year'] = df['date'].dt.year
+    df['dayofyear'] = df['date'].dt.dayofyear
+    df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
+    # 標示發薪日 (每月中旬和月底)
+    df['is_payday'] = ((df['date'].dt.day == 15) | (df['date'].dt.is_month_end)).astype(int)
+    return df
+
+train = create_features(train)
+test = create_features(test)
+
+# 將 'onpromotion' 轉換為數值型態
+train['onpromotion'] = train['onpromotion'].astype(float)
+test['onpromotion'] = test['onpromotion'].astype(float)
+
+# 對分類特徵進行 Label Encoding
+# 我們使用 test 的類別來擬合，確保 train 和 test 的編碼一致
+combined_df = pd.concat([train.drop('sales', axis=1), test])
+for col in ['family', 'type', 'cluster']:
+    le = LabelEncoder()
+    combined_df[col] = le.fit_transform(combined_df[col])
+    train[col] = le.transform(train[col])
+    test[col] = le.transform(test[col])
+
+
+# --- 4. 模型訓練 ---
+print("開始訓練 LightGBM 模型...")
+
+# 定義特徵 (X) 和目標 (y)
+features = [
+    'store_nbr', 'family', 'onpromotion', 'type', 'cluster', 'dcoilwtico',
+    'dayofweek', 'month', 'year', 'dayofyear', 'weekofyear', 'is_holiday', 'is_payday'
+]
+
+# 原始的 X 和 y
+X = train[features]
+y = np.log1p(train['sales']) # 目標轉換
+
+# 新增步驟：將訓練數據分割為新的訓練集和驗證集
+# 我們將使用 10% 的數據作為驗證集
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.1, random_state=42
+)
+
+X_test = test[features]
+
+# LightGBM 模型參數 (維持不變)
+params = {
+    'objective': 'regression_l1',
+    'metric': 'rmse',
+    'n_estimators': 2000,
+    'learning_rate': 0.05,
+    'feature_fraction': 0.8,
+    'bagging_fraction': 0.8,
+    'bagging_freq': 1,
+    'lambda_l1': 0.1,
+    'lambda_l2': 0.1,
+    'num_leaves': 31,
+    'verbose': -1,
+    'n_jobs': -1,
+    'seed': 42,
+    'boosting_type': 'gbdt',
+}
+
+# 訓練模型
+model = lgb.LGBMRegressor(**params)
+
+# 在 fit 方法中傳入正確的訓練集和驗證集
+model.fit(X_train, y_train,
+          eval_set=[(X_val, y_val)],  # <--- 關鍵修正！使用獨立的驗證集
+          eval_metric='rmse',
+          callbacks=[lgb.early_stopping(100, verbose=True)]) # 早停法現在可以正常運作了
+
+# --- 5. 預測與提交 ---
+print("產生預測結果...")
+
+predictions = model.predict(X_test)
+
+# 將預測結果還原 (從 log 空間轉回原空間)
+# 並確保預測值不為負
+final_predictions = np.expm1(predictions)
+final_predictions[final_predictions < 0] = 0
+
+# 建立提交檔案
+submission = pd.DataFrame({'id': test['id'], 'sales': final_predictions})
+submission.to_csv('submission.csv', index=False)
+
+print("\n--- submission.csv 已成功建立 ---")
+print(submission.head())
