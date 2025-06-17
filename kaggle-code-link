@@ -2,132 +2,268 @@ import pandas as pd
 import numpy as np
 import lightgbm as lgb
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
+# from sklearn.preprocessing import LabelEncoder # <-- 移除這個，LightGBM 可以直接處理 category dtype
+import gc
 
-# --- 1. 載入所有相關資料 ---
-# 為了加快處理速度，我們只使用 2017 年以後的訓練資料
-# 這樣可以讓模型更關注近期的模式
-print("載入資料中...")
+# --- 1. Load All Relevant Data ---
+print("Loading data...")
 base_path = '../input/store-sales-time-series-forecasting/'
+
+# Load data with specified dtypes for efficiency and correctness
 train = pd.read_csv(base_path + 'train.csv', parse_dates=['date'],
-                    dtype={'store_nbr': 'category', 'family': 'category'})
-train = train[train['date'].dt.year >= 2017] # 篩選近期資料
+                    dtype={'store_nbr': 'int16', 'family': 'category', 'sales': 'float32', 'onpromotion': 'int32'})
+train = train[train['date'].dt.year >= 2017].copy() # Filter recent data and ensure a copy to avoid SettingWithCopyWarning
 
 test = pd.read_csv(base_path + 'test.csv', parse_dates=['date'],
-                   dtype={'store_nbr': 'category', 'family': 'category'})
+                   dtype={'store_nbr': 'int16', 'family': 'category', 'onpromotion': 'int32'})
+
 holidays = pd.read_csv(base_path + 'holidays_events.csv', parse_dates=['date'])
-stores = pd.read_csv(base_path + 'stores.csv', dtype={'store_nbr': 'category', 'type': 'category', 'cluster': 'category'})
-oil = pd.read_csv(base_path + 'oil.csv', parse_dates=['date'])
+stores = pd.read_csv(base_path + 'stores.csv', dtype={'store_nbr': 'int16', 'type': 'category', 'cluster': 'int8'})
+oil = pd.read_csv(base_path + 'oil.csv', parse_dates=['date'], dtype={'dcoilwtico': 'float32'})
 
-# --- 2. 合併與預處理 ---
-print("合併資料與特徵工程...")
+# --- 2. Merge and Preprocess ---
+print("Merging data and preprocessing...")
 
-# 合併商店資訊
+# Merge store info
 train = train.merge(stores, on='store_nbr', how='left')
 test = test.merge(stores, on='store_nbr', how='left')
 
-# 合併油價 (使用 ffill 填充週末的缺失值)
-oil['dcoilwtico'] = oil['dcoilwtico'].ffill()
+# Handle missing oil prices (ffill for weekends, bfill for start)
+all_dates_oil = pd.date_range(start=train['date'].min(), end=test['date'].max(), freq='D')
+oil_full_dates = pd.DataFrame({'date': all_dates_oil})
+oil = oil_full_dates.merge(oil, on='date', how='left')
+oil['dcoilwtico'] = oil['dcoilwtico'].ffill().bfill() # Forward fill and then backward fill remaining NaNs
+
 train = train.merge(oil, on='date', how='left')
 test = test.merge(oil, on='date', how='left')
 
-# 合併節假日資訊
-# 為了簡化，我們只標記全國性的非工作日
-holidays = holidays[(holidays['transferred'] == False) & (holidays['locale'] == 'National')]
-train['is_holiday'] = train.date.isin(holidays.date).astype(int)
-test['is_holiday'] = test.date.isin(holidays.date).astype(int)
+# Process holidays: Add locale and description
+holidays_processed = holidays.copy()
+holidays_processed = holidays_processed.rename(columns={'type': 'holiday_type'})
+
+# Convert holiday columns to category types
+holidays_processed['holiday_type'] = holidays_processed['holiday_type'].astype('category')
+holidays_processed['locale'] = holidays_processed['locale'].astype('category')
+holidays_processed['locale_name'] = holidays_processed['locale_name'].astype('category')
+holidays_processed['description'] = holidays_processed['description'].astype('category')
+
+# Filter out transferred holidays as they are not actual holidays
+holidays_processed = holidays_processed[holidays_processed['transferred'] == False]
+
+# Merge holidays_processed with train and test
+train = train.merge(holidays_processed[['date', 'holiday_type', 'locale', 'locale_name', 'description']], on='date', how='left')
+test = test.merge(holidays_processed[['date', 'holiday_type', 'locale', 'locale_name', 'description']], on='date', how='left')
+
+# Fill NaN values in holiday columns with 'None' category
+for col in ['holiday_type', 'locale', 'locale_name', 'description']:
+    # Ensure 'None' is an existing category before filling
+    train[col] = train[col].cat.add_categories('None').fillna('None')
+    test[col] = test[col].cat.add_categories('None').fillna('None')
 
 
-# --- 3. 特徵工程 (Feature Engineering) ---
+# --- 3. Feature Engineering (Enhanced) ---
 def create_features(df):
-    """從日期創建新特徵"""
+    """Create basic time and calendar features"""
     df['dayofweek'] = df['date'].dt.dayofweek
     df['month'] = df['date'].dt.month
     df['year'] = df['date'].dt.year
     df['dayofyear'] = df['date'].dt.dayofyear
     df['weekofyear'] = df['date'].dt.isocalendar().week.astype(int)
-    # 標示發薪日 (每月中旬和月底)
+    df['day'] = df['date'].dt.day # Added day of month
+
+    # Cyclical features for seasonality
+    df['dayofyear_sin'] = np.sin(2 * np.pi * df['dayofyear'] / 365.25)
+    df['dayofyear_cos'] = np.cos(2 * np.pi * df['dayofyear'] / 365.25)
+    df['month_sin'] = np.sin(2 * np.pi * df['month'] / 12)
+    df['month_cos'] = np.cos(2 * np.pi * df['month'] / 12)
+    df['weekofyear_sin'] = np.sin(2 * np.pi * df['weekofyear'] / 52)
+    df['weekofyear_cos'] = np.cos(2 * np.pi * df['weekofyear'] / 52)
+    
+    # Payday feature
     df['is_payday'] = ((df['date'].dt.day == 15) | (df['date'].dt.is_month_end)).astype(int)
+
+    # Simplified holiday flags based on locale (instead of just is_holiday)
+    df['is_national_holiday'] = (df['locale'] == 'National').astype(int)
+    df['is_regional_holiday'] = (df['locale'] == 'Regional').astype(int)
+    df['is_local_holiday'] = (df['locale'] == 'Local').astype(int)
+
     return df
 
 train = create_features(train)
 test = create_features(test)
 
-# 將 'onpromotion' 轉換為數值型態
+# Convert 'onpromotion' to float
 train['onpromotion'] = train['onpromotion'].astype(float)
 test['onpromotion'] = test['onpromotion'].astype(float)
 
-# 對分類特徵進行 Label Encoding
-# 我們使用 test 的類別來擬合，確保 train 和 test 的編碼一致
-combined_df = pd.concat([train.drop('sales', axis=1), test])
-for col in ['family', 'type', 'cluster']:
-    le = LabelEncoder()
-    combined_df[col] = le.fit_transform(combined_df[col])
-    train[col] = le.transform(train[col])
-    test[col] = le.transform(test[col])
+# --- Lag and Rolling Features (CRITICAL FOR PERFORMANCE, CAREFUL WITH LEAKAGE) ---
+# Combine train and test to ensure consistent lag/rolling feature calculation
+# We need to handle 'sales' for test set (NaN)
+full_df = pd.concat([train.drop(columns=['sales']), test], axis=0, ignore_index=True)
+full_df['sales'] = train['sales'].reindex(full_df.index) # Add train sales back
+full_df = full_df.sort_values(by=['store_nbr', 'family', 'date']).reset_index(drop=True)
+
+# Function to add dynamic features
+def add_time_series_features_dynamic(df):
+    # Lag sales features (using .shift(1) to avoid leakage)
+    for lag in [7, 14, 21, 28, 35, 42, 60, 90, 180, 365]: # Added more lags
+        df[f'sales_lag_{lag}'] = df.groupby(['store_nbr', 'family'], observed=False)['sales'].transform(lambda x: x.shift(lag))
+
+    # Rolling mean/std for sales and onpromotion
+    for window in [7, 14, 30, 60]: # Added 60-day window
+        df[f'sales_rolling_mean_{window}'] = df.groupby(['store_nbr', 'family'], observed=False)['sales'].transform(lambda x: x.rolling(window, min_periods=1).mean().shift(1))
+        df[f'sales_rolling_std_{window}'] = df.groupby(['store_nbr', 'family'], observed=False)['sales'].transform(lambda x: x.rolling(window, min_periods=1).std().shift(1))
+        df[f'onpromotion_rolling_mean_{window}'] = df.groupby(['store_nbr', 'family'], observed=False)['onpromotion'].transform(lambda x: x.rolling(window, min_periods=1).mean().shift(1))
+    
+    # Oil price rolling mean/std (store_nbr isn't relevant here, but keeps consistent structure)
+    df['dcoilwtico_rolling_mean_7'] = df.groupby('store_nbr', observed=False)['dcoilwtico'].transform(lambda x: x.rolling(7, min_periods=1).mean().shift(1))
+    df['dcoilwtico_rolling_std_7'] = df.groupby('store_nbr', observed=False)['dcoilwtico'].transform(lambda x: x.rolling(7, min_periods=1).std().shift(1))
+    
+    return df
+
+full_df = add_time_series_features_dynamic(full_df)
+
+# Split back into train and test after feature engineering
+train_processed = full_df.loc[full_df['id'].isin(train['id'])].copy()
+test_processed = full_df.loc[full_df['id'].isin(test['id'])].copy()
+
+# Ensure original sales are used for train_processed (should be already there, but explicit is better)
+train_processed['sales'] = train['sales'].values
+
+# Delete full_df to free memory
+del full_df
+gc.collect()
+
+# --- NO LABEL ENCODING FOR CATEGORICAL FEATURES ---
+# LightGBM can handle 'category' dtype directly.
+# Ensure 'store_nbr', 'family', 'type', 'cluster', 'holiday_type', 'locale', 'locale_name', 'description' are category dtype.
+# store_nbr, family, type, cluster are already loaded as category or int16.
+# holiday_type, locale, locale_name, description are already converted to category.
+
+# Let's explicitly convert them again for safety if they were touched by other operations
+category_cols_to_convert = ['family', 'type', 'cluster', 'holiday_type', 'locale', 'locale_name', 'description']
+
+for col in category_cols_to_convert:
+    train_processed.loc[:, col] = train_processed.loc[:, col].astype('category')
+    test_processed.loc[:, col] = test_processed.loc[:, col].astype('category')
 
 
-# --- 4. 模型訓練 ---
-print("開始訓練 LightGBM 模型...")
+# --- 4. Model Training ---
+print("Starting LightGBM model training...")
 
-# 定義特徵 (X) 和目標 (y)
+# Define features (X) and target (y)
 features = [
     'store_nbr', 'family', 'onpromotion', 'type', 'cluster', 'dcoilwtico',
-    'dayofweek', 'month', 'year', 'dayofyear', 'weekofyear', 'is_holiday', 'is_payday'
+    'dayofweek', 'month', 'year', 'dayofyear', 'weekofyear', 'day',
+    'is_payday', 'dayofyear_sin', 'dayofyear_cos', 'month_sin', 'month_cos',
+    'weekofyear_sin', 'weekofyear_cos', 'is_national_holiday', 'is_regional_holiday', 'is_local_holiday',
+    'holiday_type', 'locale', 'locale_name', 'description' # Include full holiday features
 ]
 
-# 原始的 X 和 y
-X = train[features]
-y = np.log1p(train['sales']) # 目標轉換
+# Add all generated lag and rolling features to the list
+for lag in [7, 14, 21, 28, 35, 42, 60, 90, 180, 365]:
+    features.append(f'sales_lag_{lag}')
+for window in [7, 14, 30, 60]:
+    features.append(f'sales_rolling_mean_{window}')
+    features.append(f'sales_rolling_std_{window}')
+    features.append(f'onpromotion_rolling_mean_{window}')
+features.extend(['dcoilwtico_rolling_mean_7', 'dcoilwtico_rolling_std_7'])
 
-# 新增步驟：將訓練數據分割為新的訓練集和驗證集
-# 我們將使用 10% 的數據作為驗證集
-X_train, X_val, y_train, y_val = train_test_split(
-    X, y, test_size=0.1, random_state=42
-)
+# Ensure all features are present in processed dataframes
+# Remove any features from the list that might be missing (shouldn't happen with current logic)
+features = [f for f in features if f in train_processed.columns and f in test_processed.columns]
+# Print out if any were removed for debugging
+if len(features) != (len(set(features).union(set(train_processed.columns)).union(set(test_processed.columns))) - len(train_processed.columns) - len(test_processed.columns) + len(set(train_processed.columns).intersection(set(test_processed.columns)))): # This is a rough check
+    print("Warning: Some features were removed from the 'features' list due to not being present in both train_processed and test_processed.")
 
-X_test = test[features]
 
-# LightGBM 模型參數 (維持不變)
+X = train_processed[features].copy() # Explicit copy to avoid SettingWithCopyWarning
+y = np.log1p(train_processed['sales']) # Target transformation
+
+# Split the training data into a new training set and a validation set
+val_split_date = pd.to_datetime('2017-08-15')
+
+X_train = X[train_processed['date'] <= val_split_date].copy() # Explicit copy
+y_train = y[train_processed['date'] <= val_split_date].copy() # Explicit copy
+
+X_val = X[train_processed['date'] > val_split_date].copy() # Explicit copy
+y_val = y[train_processed['date'] > val_split_date].copy() # Explicit copy
+
+# Fallback for empty validation set
+if X_val.empty:
+    print("Warning: Validation set is empty. Using a standard train_test_split (not time-based).")
+    X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.1, random_state=42)
+    # Ensure copies after train_test_split as well
+    X_train = X_train.copy()
+    X_val = X_val.copy()
+    y_train = y_train.copy()
+    y_val = y_val.copy()
+
+X_test = test_processed[features].copy() # Explicit copy
+
+print(f"Training set size: {len(X_train)} records")
+print(f"Validation set size: {len(X_val)} records")
+print(f"Test set size: {len(X_test)} records")
+
+# LightGBM Model Parameters (tweaked for potential better performance)
 params = {
-    'objective': 'regression_l1',
+    'objective': 'regression_l1', # MAE objective for robustness against outliers
     'metric': 'rmse',
-    'n_estimators': 2000,
-    'learning_rate': 0.05,
-    'feature_fraction': 0.8,
-    'bagging_fraction': 0.8,
+    'n_estimators': 4000, # Increased estimators, rely on early stopping
+    'learning_rate': 0.01, # Lower learning rate for better convergence
+    'feature_fraction': 0.7, # Subsample features
+    'bagging_fraction': 0.7, # Subsample data
     'bagging_freq': 1,
-    'lambda_l1': 0.1,
-    'lambda_l2': 0.1,
-    'num_leaves': 31,
+    'lambda_l1': 1.0, # L1 regularization
+    'lambda_l2': 1.0, # L2 regularization
+    'num_leaves': 64, # Increased complexity slightly from 31 to 64
     'verbose': -1,
     'n_jobs': -1,
     'seed': 42,
     'boosting_type': 'gbdt',
+    'colsample_bytree': 0.7, # Alias for feature_fraction
+    'subsample': 0.7, # Alias for bagging_fraction
+    'reg_alpha': 1.0, # Alias for lambda_l1
+    'reg_lambda': 1.0, # Alias for lambda_l2
+    'min_child_samples': 25, # Slightly reduced from 30 to allow more complex splits
 }
 
-# 訓練模型
+# Train the model
 model = lgb.LGBMRegressor(**params)
 
-# 在 fit 方法中傳入正確的訓練集和驗證集
+# Define categorical features for LightGBM
+# store_nbr is int16, LightGBM can treat it as categorical if specified.
+# The remaining are already converted to 'category' dtype.
+categorical_features_for_lgbm = [
+    'store_nbr', # Explicitly treat store_nbr as categorical
+    'family', 'type', 'cluster', 'holiday_type', 'locale', 'locale_name', 'description'
+]
+# Filter to ensure only features present in X_train are passed
+categorical_features_for_lgbm = [f for f in categorical_features_for_lgbm if f in X_train.columns]
+
+
 model.fit(X_train, y_train,
-          eval_set=[(X_val, y_val)],  # <--- 關鍵修正！使用獨立的驗證集
+          eval_set=[(X_val, y_val)],
           eval_metric='rmse',
-          callbacks=[lgb.early_stopping(100, verbose=True)]) # 早停法現在可以正常運作了
+          callbacks=[lgb.early_stopping(200, verbose=True)], # Increased patience for early stopping
+          categorical_feature=categorical_features_for_lgbm # Pass the filtered list
+         )
 
-# --- 5. 預測與提交 ---
-print("產生預測結果...")
+# Clear memory
+del X, y, X_train, y_train, X_val, y_val, train_processed
+gc.collect()
 
+# --- 5. Predict and Submit ---
+print("Generating predictions...")
 predictions = model.predict(X_test)
 
-# 將預測結果還原 (從 log 空間轉回原空間)
-# 並確保預測值不為負
+# Convert predictions back (from log space) and ensure non-negative
 final_predictions = np.expm1(predictions)
 final_predictions[final_predictions < 0] = 0
 
-# 建立提交檔案
+# Create submission file
 submission = pd.DataFrame({'id': test['id'], 'sales': final_predictions})
 submission.to_csv('submission.csv', index=False)
 
-print("\n--- submission.csv 已成功建立 ---")
+print("\n--- submission.csv has been successfully created ---")
 print(submission.head())
